@@ -1,0 +1,44 @@
+:root {
+  color-scheme: dark;
+  --bg: #11151c;
+  --card: #1b212b;
+  --ink: #e8eef7;
+  --muted: #93a0b5;
+  --line: #2a3342;
+  --accent: #6cb6ff;
+  --good: #3dd68c;
+  --bad: #ff6b6b;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+body {
+  margin: 0 auto;
+  max-width: 1100px;
+  padding: 24px 16px 64px;
+  background: var(--bg);
+  color: var(--ink);
+}
+h1 { font-size: 1.4rem; margin: 0 0 8px; }
+h2 { font-size: 1.05rem; margin: 0 0 12px; }
+section {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin: 16px 0;
+}
+.note { color: var(--muted); font-size: 0.9rem; }
+dl { display: grid; grid-template-columns: 10rem 1fr; gap: 6px 12px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; font-variant-numeric: tabular-nums; }
+.windows { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: right; }
+th:nth-child(2), td:nth-child(2), th:first-child, td:first-child { text-align: left; }
+canvas { width: 100%; height: auto; background: #0d1117; border-radius: 6px; }
+.legend { color: var(--muted); font-size: 0.8rem; }
+.phase-warming { color: #f0c14b; }
+.phase-running { color: var(--good); }
+.phase-degraded { color: var(--bad); }
+.status-provisional { color: #f0c14b; }
+.status-active { color: var(--good); }
+.status-rejected { color: var(--muted); }

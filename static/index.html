@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gate BTC-USDT trend model</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <h1>Gate BTC-USDT trend observability</h1>
+    <p id="granularity-note" class="note"></p>
+  </header>
+
+  <section id="status-panel">
+    <h2>Status</h2>
+    <dl>
+      <dt>Connection</dt><dd id="connection">—</dd>
+      <dt>Data age</dt><dd id="data-age">—</dd>
+      <dt>Run phase</dt><dd id="phase">—</dd>
+      <dt>Training</dt><dd id="training">—</dd>
+      <dt>Current model</dt><dd id="model">—</dd>
+      <dt>Next train</dt><dd id="next-train">—</dd>
+      <dt>Alarm</dt><dd id="alarm">none</dd>
+    </dl>
+  </section>
+
+  <section id="curves-panel">
+    <h2>Last 5 minutes</h2>
+    <label>Horizon
+      <select id="horizon">
+        <option value="10ms">10ms</option>
+        <option value="25ms" selected>25ms</option>
+        <option value="50ms">50ms</option>
+      </select>
+    </label>
+    <canvas id="curve" width="960" height="280"></canvas>
+    <p class="legend">mid · predicted ticks · actual ticks</p>
+  </section>
+
+  <section id="metrics-panel">
+    <h2>Aggregate metrics</h2>
+    <div class="windows">
+      <article><h3>1 hour</h3><div id="m-1h"></div></article>
+      <article><h3>24 hours</h3><div id="m-24h"></div></article>
+      <article><h3>7 days</h3><div id="m-7d"></div></article>
+    </div>
+  </section>
+
+  <section id="factors-panel">
+    <h2>Factors, weights, contributions</h2>
+    <table id="factors">
+      <thead>
+        <tr>
+          <th>#</th><th>Factor</th><th>x</th>
+          <th>w 10</th><th>c 10</th>
+          <th>w 25</th><th>c 25</th>
+          <th>w 50</th><th>c 50</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="models-panel">
+    <h2>Model history</h2>
+    <table id="models">
+      <thead>
+        <tr>
+          <th>Version</th><th>Status</th><th>Train window</th><th>Validation</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <script src="/app.js"></script>
+</body>
+</html>
