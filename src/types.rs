@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const FEATURE_COUNT: usize = 17;
-pub const FEATURE_VERSION: &str = "factors_1_17_v1";
+pub const FEATURE_VERSION: &str = "factors_1_17_trade_flow_v2";
 pub const DEPTH_GRANULARITY_MS: u32 = 20;
 pub const DEPTH_GRANULARITY_NOTE: &str =
     "Gate futures.obu 50-level stream pushes ~20ms batches; 10ms order-flow factors are not true 10ms event-time.";

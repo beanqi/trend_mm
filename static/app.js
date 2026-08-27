@@ -82,27 +82,37 @@ function drawCurves(points) {
   const preds = points.map((p) => p.pred);
   const acts = points.map((p) => p.actual);
   const minM = Math.min(...mids), maxM = Math.max(...mids);
-  const ticks = preds.concat(acts).filter((v) => v != null);
-  const minT = ticks.length ? Math.min(...ticks) : -1;
-  const maxT = ticks.length ? Math.max(...ticks) : 1;
+  const extent = (vals) => Math.max(0.1, ...vals.filter((v) => v != null).map((v) => Math.abs(v)));
+  const predExtent = extent(preds);
+  const actualExtent = extent(acts);
   const x = (i) => (i / Math.max(points.length - 1, 1)) * (w - 20) + 10;
-  const yMid = (v) => h * 0.35 - ((v - minM) / (maxM - minM + 1e-9)) * (h * 0.28);
-  const yTick = (v) => h * 0.82 - ((v - minT) / (maxT - minT + 1e-9)) * (h * 0.28);
+  const yMid = (v) => 78 - ((v - minM) / (maxM - minM + 1e-9)) * 58;
+  const yTrack = (v, center, halfHeight, scale) => center - (v / scale) * halfHeight;
   const line = (vals, color, yfn) => {
     ctx.beginPath();
     ctx.strokeStyle = color;
     let started = false;
     vals.forEach((v, i) => {
-      if (v == null) return;
+      if (v == null) { started = false; return; }
       const xx = x(i), yy = yfn(v);
       if (!started) { ctx.moveTo(xx, yy); started = true; }
       else ctx.lineTo(xx, yy);
     });
     ctx.stroke();
   };
+  ctx.font = "11px system-ui";
+  ctx.fillStyle = "#6cb6ff";
+  ctx.fillText(`mid ${minM.toFixed(1)} … ${maxM.toFixed(1)}`, 12, 13);
+  ctx.strokeStyle = "#334155";
+  ctx.beginPath(); ctx.moveTo(10, 140); ctx.lineTo(w - 10, 140); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(10, 230); ctx.lineTo(w - 10, 230); ctx.stroke();
+  ctx.fillStyle = "#f0c14b";
+  ctx.fillText(`pred ±${predExtent.toFixed(2)} tick`, 12, 101);
+  ctx.fillStyle = "#3dd68c";
+  ctx.fillText(`actual ±${actualExtent.toFixed(2)} tick`, 12, 191);
   line(mids, "#6cb6ff", yMid);
-  line(preds, "#f0c14b", yTick);
-  line(acts, "#3dd68c", yTick);
+  line(preds, "#f0c14b", (v) => yTrack(v, 140, 34, predExtent));
+  line(acts, "#3dd68c", (v) => yTrack(v, 230, 34, actualExtent));
 }
 
 async function refreshSamples() {

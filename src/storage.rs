@@ -285,12 +285,13 @@ impl Storage {
                     created_at_ms, activated_at_ms, depth_granularity_note
              FROM model_versions
              WHERE status IN ('active','provisional')
+               AND feature_version = ?1
              ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'provisional' THEN 1 ELSE 2 END,
                       COALESCE(activated_at_ms, created_at_ms) DESC
              LIMIT 1",
         )?;
         let row = stmt
-            .query_row([], |r| {
+            .query_row(params![FEATURE_VERSION], |r| {
                 Ok(ModelRow {
                     version: r.get(0)?,
                     status: r.get(1)?,
@@ -400,11 +401,11 @@ impl Storage {
             "SELECT ts_ms, mid, tick_size, factors_json, model_version, feature_version,
                     pred_10, pred_25, pred_50, actual_10, actual_25, actual_50, quality
              FROM evaluation_samples
-             WHERE ts_ms >= ?1 AND ts_ms <= ?2
+             WHERE ts_ms >= ?1 AND ts_ms <= ?2 AND feature_version = ?3
              ORDER BY ts_ms ASC",
         )?;
         let rows: Vec<SampleRow> = stmt
-            .query_map(params![from_ms, to_ms], map_sample)?
+            .query_map(params![from_ms, to_ms, FEATURE_VERSION], map_sample)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(downsample(rows, max_points))
@@ -421,20 +422,21 @@ impl Storage {
         let sql = if model_version.is_some() {
             "SELECT pred_10, pred_25, pred_50, actual_10, actual_25, actual_50
              FROM evaluation_samples
-             WHERE ts_ms >= ?1 AND ts_ms <= ?2 AND model_version = ?3"
+             WHERE ts_ms >= ?1 AND ts_ms <= ?2 AND model_version = ?3
+               AND feature_version = ?4"
         } else {
             "SELECT pred_10, pred_25, pred_50, actual_10, actual_25, actual_50
              FROM evaluation_samples
-             WHERE ts_ms >= ?1 AND ts_ms <= ?2"
+             WHERE ts_ms >= ?1 AND ts_ms <= ?2 AND feature_version = ?3"
         };
         let mut stmt = conn.prepare(sql)?;
         let mut acc = [MetricAcc::default(), MetricAcc::default(), MetricAcc::default()];
         let mut buckets: [Vec<(f64, f64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         {
             let mut rows = if let Some(v) = model_version {
-                stmt.query(params![from_ms, to_ms, v])?
+                stmt.query(params![from_ms, to_ms, v, FEATURE_VERSION])?
             } else {
-                stmt.query(params![from_ms, to_ms])?
+                stmt.query(params![from_ms, to_ms, FEATURE_VERSION])?
             };
             while let Some(r) = rows.next()? {
                 let pred = [r.get::<_, Option<f64>>(0)?, r.get(1)?, r.get(2)?];
@@ -731,6 +733,7 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::eval::CompletedSample;
+    use crate::signal::model::cold_start_model;
 
     fn sample(ts: i64, feat: &str, pred: [f64; 3], actual: [Option<f64>; 3]) -> CompletedSample {
         CompletedSample {
@@ -792,6 +795,27 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts_ms, 10);
         assert_eq!(rows[0].feature_version, FEATURE_VERSION);
+        assert_eq!(st.query_samples(0, 100, 10).unwrap().len(), 1);
+        assert_eq!(st.query_metrics(0, 100, None, 0.05).unwrap()[0].n_total, 1);
+    }
+
+    #[test]
+    fn old_feature_model_is_not_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Storage::open(&dir.path().join("e.db")).unwrap();
+        let mut old = cold_start_model();
+        old.version = "old-active".into();
+        old.status = ModelStatus::Active;
+        old.feature_version = "old_factors".into();
+        st.insert_model(&old).unwrap();
+        assert!(st.load_last_active_model().unwrap().is_none());
+
+        let current = cold_start_model();
+        st.insert_model(&current).unwrap();
+        assert_eq!(
+            st.load_last_active_model().unwrap().unwrap().feature_version,
+            FEATURE_VERSION
+        );
     }
 
     #[test]

@@ -27,17 +27,26 @@ struct TimedFlow {
     depth_after: DepthAt,
 }
 
+#[derive(Clone, Debug)]
+struct PendingBookFlow {
+    before: Top10,
+    flow: MatchedFlow,
+    depth_after: DepthAt,
+}
+
 pub struct SignalEngine {
     cfg: Config,
     book: LocalBook,
     trades: TradeDeduper,
     pending: Vec<PendingTrade>,
+    pending_book: Option<PendingBookFlow>,
     events: VecDeque<TimedFlow>,
     ewma: EwmaNorm,
     model: FittedModel,
     tick_size: Option<f64>,
     last_top: Option<Top10>,
     last_event_at: Option<Instant>,
+    last_book_at: Option<Instant>,
     warm_started: Instant,
     interrupted: bool,
     last_raw: [f64; FEATURE_COUNT],
@@ -67,12 +76,14 @@ impl SignalEngine {
             book: LocalBook::new(),
             trades: TradeDeduper::new(),
             pending: Vec::new(),
+            pending_book: None,
             events: VecDeque::new(),
             ewma: EwmaNorm::new(),
             model,
             tick_size: None,
             last_top: None,
             last_event_at: None,
+            last_book_at: None,
             warm_started: Instant::now(),
             interrupted: true,
             last_raw: [0.0; FEATURE_COUNT],
@@ -104,9 +115,12 @@ impl SignalEngine {
         self.ewma.reset();
         self.events.clear();
         self.pending.clear();
+        self.pending_book = None;
         self.trades.clear();
         self.last_top = None;
         self.last_mid = None;
+        self.last_event_at = None;
+        self.last_book_at = None;
     }
 
     pub fn apply(&mut self, ev: MarketEvent, now: Instant) -> bool {
@@ -153,11 +167,11 @@ impl SignalEngine {
             }
             MarketEvent::Trade(t) => {
                 if let Some((agg, qty)) = self.trades.accept(&t) {
-                    self.pending.push(PendingTrade {
+                    self.on_trade(PendingTrade {
                         price: t.price,
                         qty,
                         aggressor: agg,
-                    });
+                    }, now);
                 }
                 false
             }
@@ -167,12 +181,15 @@ impl SignalEngine {
     fn on_book_replaced(&mut self, now: Instant) {
         self.events.clear();
         self.pending.clear();
+        self.pending_book = None;
         self.ewma.reset();
         self.interrupted = true;
         self.warm_started = now;
         if let Some(top) = self.book.top10() {
             self.last_top = Some(top);
             self.last_mid = Some(top.mid());
+            self.last_event_at = Some(now);
+            self.last_book_at = Some(now);
             if let Some(tick) = self.tick_size {
                 self.recompute(top, tick, now, Duration::ZERO);
             }
@@ -180,6 +197,41 @@ impl SignalEngine {
             self.last_top = None;
             self.last_mid = None;
         }
+    }
+
+    fn on_trade(&mut self, trade: PendingTrade, now: Instant) {
+        let reference_top = self
+            .pending_book
+            .as_ref()
+            .map(|pending| pending.before)
+            .or(self.last_top);
+        let matched = self.pending_book.as_mut().is_some_and(|pending| {
+            pending
+                .flow
+                .exclude_trade_from_cancels(&pending.before, &trade)
+        });
+        if !matched {
+            self.pending.push(trade.clone());
+        }
+
+        let Some(top) = reference_top else {
+            return;
+        };
+        let flow = MatchedFlow::from_trade(&top, &trade);
+        let depth = self
+            .last_top
+            .map(|current| DepthAt::from_top(&current))
+            .unwrap_or_else(|| DepthAt::from_top(&top));
+        self.push_flow(now, flow, depth);
+        if let Some(tick) = self.tick_size {
+            let current = self.last_top.unwrap_or(top);
+            let dt = self
+                .last_event_at
+                .map(|at| now.saturating_duration_since(at))
+                .unwrap_or(Duration::from_millis(1));
+            self.recompute(current, tick, now, dt);
+        }
+        self.last_event_at = Some(now);
     }
 
     fn on_book_updated(&mut self, now: Instant) {
@@ -192,26 +244,49 @@ impl SignalEngine {
             self.last_mid = Some(after.mid());
             return;
         };
-        if let Some(prev) = self.last_event_at {
-            if now.duration_since(prev) > LONG_GAP {
-                self.enter_warming();
-                self.last_top = Some(after);
-                self.last_mid = Some(after.mid());
-                self.last_event_at = Some(now);
-                return;
-            }
+        if self
+            .last_book_at
+            .is_some_and(|prev| now.duration_since(prev) > LONG_GAP)
+        {
+            self.enter_warming();
+            self.last_top = Some(after);
+            self.last_mid = Some(after.mid());
+            self.last_event_at = Some(now);
+            self.last_book_at = Some(now);
+            return;
         }
-        let pending = std::mem::take(&mut self.pending);
-        // Match only against this adjacent book update; leftover trade qty is dropped.
-        let (flow, _leftover) = MatchedFlow::from_delta_and_trades(&before, &after, &pending);
-        self.push_flow(now, flow, DepthAt::from_top(&after));
+        if let Some(pending) = self.pending_book.take().filter(|p| p.flow.has_cancels()) {
+            self.push_flow(now, pending.flow, pending.depth_after);
+        }
+
+        let depth_after = DepthAt::from_top(&after);
+        let mut book_flow = MatchedFlow::from_book_delta(&before, &after);
+        let additions = book_flow.take_additions();
+        if additions.has_additions() {
+            self.push_flow(now, additions, depth_after);
+        }
+        let mut pending_book = PendingBookFlow {
+            before,
+            flow: book_flow,
+            depth_after,
+        };
+        for trade in std::mem::take(&mut self.pending) {
+            pending_book
+                .flow
+                .exclude_trade_from_cancels(&pending_book.before, &trade);
+        }
+        self.pending_book = Some(pending_book);
         self.last_top = Some(after);
         self.last_mid = Some(after.mid());
         if let Some(tick) = self.tick_size {
-            let dt = self.last_event_at.map(|t| now.saturating_duration_since(t)).unwrap_or(Duration::from_millis(20));
+            let dt = self
+                .last_event_at
+                .map(|t| now.saturating_duration_since(t))
+                .unwrap_or(Duration::from_millis(20));
             self.recompute(after, tick, now, dt);
         }
         self.last_event_at = Some(now);
+        self.last_book_at = Some(now);
     }
 
     fn push_flow(&mut self, now: Instant, flow: MatchedFlow, depth: DepthAt) {
@@ -273,10 +348,8 @@ impl SignalEngine {
         if self.interrupted || self.ewma.accumulated() < self.cfg.warm_period {
             return DataQuality::Warming;
         }
-        if let Some(t) = self.last_event_at {
-            if t.elapsed() > LONG_GAP {
-                return DataQuality::Stale;
-            }
+        if self.last_book_at.is_some_and(|t| t.elapsed() > LONG_GAP) {
+            return DataQuality::Stale;
         }
         DataQuality::Ok
     }
@@ -410,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn trades_wait_for_book_delta_then_match_decrease() {
+    fn trade_is_immediate_and_matching_decrease_is_not_double_counted() {
         let mut e = SignalEngine::new(cfg(), cold_start_model());
         let now = Instant::now();
         e.apply(MarketEvent::TickSize(0.1), now);
@@ -434,7 +507,8 @@ mod tests {
             now + Duration::from_millis(1),
         );
         assert_eq!(e.pending.len(), 1);
-        assert!(e.events.is_empty(), "trade must not match against an unchanged book");
+        assert_eq!(e.events.len(), 1, "public trade must affect factors immediately");
+        assert!((e.events[0].flow.exec_bid[0] - 3.0).abs() < 1e-9);
         e.apply(
             MarketEvent::DepthIncremental {
                 bids: vec![(100.0, 4.0)],
@@ -447,13 +521,22 @@ mod tests {
         );
         assert!(e.pending.is_empty());
         assert_eq!(e.events.len(), 1);
-        let flow = &e.events[0].flow;
-        assert!((flow.exec_bid[0] - 3.0).abs() < 1e-9);
-        assert!((flow.cancel_bid[0] - 3.0).abs() < 1e-9);
+        assert!((e.pending_book.as_ref().unwrap().flow.cancel_bid[0] - 3.0).abs() < 1e-9);
+        e.apply(
+            MarketEvent::DepthIncremental {
+                bids: vec![],
+                asks: vec![],
+                start_u: 3,
+                end_u: 3,
+                exch_time_ms: 0,
+            },
+            now + Duration::from_millis(22),
+        );
+        assert!((e.events.back().unwrap().flow.cancel_bid[0] - 3.0).abs() < 1e-9);
     }
 
     #[test]
-    fn leftover_trade_not_carried_to_later_book_update() {
+    fn trade_larger_than_net_decrease_keeps_full_execution() {
         let mut e = SignalEngine::new(cfg(), cold_start_model());
         let now = Instant::now();
         e.apply(MarketEvent::TickSize(0.1), now);
@@ -487,7 +570,8 @@ mod tests {
             now + Duration::from_millis(2),
         );
         assert!(e.pending.is_empty());
-        assert!((e.events.back().unwrap().flow.exec_bid[0] - 2.0).abs() < 1e-9);
+        assert!((e.events[0].flow.exec_bid[0] - 5.0).abs() < 1e-9);
+        assert_eq!(e.pending_book.as_ref().unwrap().flow.cancel_bid[0], 0.0);
         e.apply(
             MarketEvent::DepthIncremental {
                 bids: vec![(100.0, 3.0)],
@@ -498,8 +582,81 @@ mod tests {
             },
             now + Duration::from_millis(3),
         );
-        let last = e.events.back().unwrap();
-        assert_eq!(last.flow.exec_bid[0], 0.0);
-        assert!((last.flow.cancel_bid[0] - 5.0).abs() < 1e-9);
+        assert!((e.pending_book.as_ref().unwrap().flow.cancel_bid[0] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trade_arriving_after_book_update_reclassifies_the_decrease() {
+        let mut e = SignalEngine::new(cfg(), cold_start_model());
+        let now = Instant::now();
+        e.apply(MarketEvent::TickSize(0.1), now);
+        let (b, a) = full_book(100.0, 100.1, 10.0, 10.0);
+        e.apply(
+            MarketEvent::DepthSnapshot {
+                bids: b,
+                asks: a,
+                u: 1,
+                exch_time_ms: 0,
+            },
+            now,
+        );
+        e.apply(
+            MarketEvent::DepthIncremental {
+                bids: vec![(100.0, 4.0)],
+                asks: vec![],
+                start_u: 2,
+                end_u: 2,
+                exch_time_ms: 0,
+            },
+            now + Duration::from_millis(1),
+        );
+        assert!((e.pending_book.as_ref().unwrap().flow.cancel_bid[0] - 6.0).abs() < 1e-9);
+        e.apply(
+            MarketEvent::Trade(PublicTrade {
+                id: 30,
+                price: 100.0,
+                size: -3.0,
+                is_internal: false,
+            }),
+            now + Duration::from_millis(2),
+        );
+        assert!((e.events.back().unwrap().flow.exec_bid[0] - 3.0).abs() < 1e-9);
+        assert!((e.pending_book.as_ref().unwrap().flow.cancel_bid[0] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_level_buy_sweep_immediately_sets_trade_factors() {
+        let mut e = SignalEngine::new(cfg(), cold_start_model());
+        let now = Instant::now();
+        e.apply(MarketEvent::TickSize(0.1), now);
+        let (b, a) = full_book(100.0, 100.1, 10.0, 10.0);
+        e.apply(
+            MarketEvent::DepthSnapshot {
+                bids: b,
+                asks: a,
+                u: 1,
+                exch_time_ms: 0,
+            },
+            now,
+        );
+        for (id, price, size) in [(31, 100.1, 8.0), (32, 100.2, 12.0), (33, 100.3, 20.0)] {
+            e.apply(
+                MarketEvent::Trade(PublicTrade {
+                    id,
+                    price,
+                    size,
+                    is_internal: false,
+                }),
+                now + Duration::from_millis(id - 30),
+            );
+        }
+        let executed: f64 = e
+            .events
+            .iter()
+            .flat_map(|event| event.flow.exec_ask)
+            .sum();
+        assert!((executed - 40.0).abs() < 1e-9);
+        assert!(e.snapshot().raw[11] > 0.99, "10ms trade imbalance must see the sweep");
+        assert!(e.snapshot().raw[12] > 0.99, "50ms trade imbalance must see the sweep");
     }
 }

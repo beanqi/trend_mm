@@ -92,14 +92,65 @@ pub struct MatchedFlow {
 }
 
 impl MatchedFlow {
-    /// Same-price/side matching: take trade volume from book decreases first;
-    /// leftover decrease is treated as cancel.
-    pub fn from_delta_and_trades(
-        before: &Top10,
-        after: &Top10,
-        trades: &[PendingTrade],
-    ) -> (Self, Vec<PendingTrade>) {
-        match_trades(before, after, trades)
+    pub fn from_book_delta(before: &Top10, after: &Top10) -> Self {
+        book_delta(before, after)
+    }
+
+    /// Public trades are authoritative execution volume. Book deltas are only
+    /// used separately to keep the same decrease from also becoming a cancel.
+    pub fn from_trade(top: &Top10, trade: &PendingTrade) -> Self {
+        let mut flow = Self::default();
+        match trade.aggressor {
+            Aggressor::Sell => record_trade(
+                trade,
+                &top.bids,
+                &mut flow.exec_bid,
+                &mut flow.n_exec_bid,
+            ),
+            Aggressor::Buy => record_trade(
+                trade,
+                &top.asks,
+                &mut flow.exec_ask,
+                &mut flow.n_exec_ask,
+            ),
+        }
+        flow
+    }
+
+    /// Removes the part of a book decrease explained by an already-recorded
+    /// public trade. Returns true when any decrease was matched.
+    pub fn exclude_trade_from_cancels(&mut self, before: &Top10, trade: &PendingTrade) -> bool {
+        let matched = match trade.aggressor {
+            Aggressor::Sell => take_from_decrease(trade, &before.bids, &mut self.cancel_bid),
+            Aggressor::Buy => take_from_decrease(trade, &before.asks, &mut self.cancel_ask),
+        };
+        self.refresh_cancel_counts();
+        matched
+    }
+
+    pub fn take_additions(&mut self) -> Self {
+        Self {
+            add_bid: std::mem::take(&mut self.add_bid),
+            add_ask: std::mem::take(&mut self.add_ask),
+            n_add_bid: std::mem::take(&mut self.n_add_bid),
+            n_add_ask: std::mem::take(&mut self.n_add_ask),
+            ..Self::default()
+        }
+    }
+
+    pub fn has_additions(&self) -> bool {
+        self.add_bid.iter().any(|q| *q > 0.0) || self.add_ask.iter().any(|q| *q > 0.0)
+    }
+
+    pub fn has_cancels(&self) -> bool {
+        self.cancel_bid.iter().any(|q| *q > 0.0) || self.cancel_ask.iter().any(|q| *q > 0.0)
+    }
+
+    fn refresh_cancel_counts(&mut self) {
+        for i in 0..MODEL_LEVELS {
+            self.n_cancel_bid[i] = u32::from(self.cancel_bid[i] > 0.0);
+            self.n_cancel_ask[i] = u32::from(self.cancel_ask[i] > 0.0);
+        }
     }
 }
 
@@ -119,11 +170,7 @@ fn index_of(levels: &[crate::market::book::Level; MODEL_LEVELS], price: f64) -> 
     levels.iter().position(|l| prices_eq(l.price, price))
 }
 
-pub fn match_trades(
-    before: &Top10,
-    after: &Top10,
-    trades: &[PendingTrade],
-) -> (MatchedFlow, Vec<PendingTrade>) {
+fn book_delta(before: &Top10, after: &Top10) -> MatchedFlow {
     let mut flow = MatchedFlow::default();
 
     for i in 0..MODEL_LEVELS {
@@ -139,91 +186,69 @@ pub fn match_trades(
         }
     }
 
-    let mut dec_bid = [0.0; MODEL_LEVELS];
-    let mut dec_ask = [0.0; MODEL_LEVELS];
     for i in 0..MODEL_LEVELS {
         let new_b = qty_at(&after.bids, before.bids[i].price);
         if before.bids[i].qty > new_b {
-            dec_bid[i] = before.bids[i].qty - new_b;
+            flow.cancel_bid[i] = before.bids[i].qty - new_b;
         }
         let new_a = qty_at(&after.asks, before.asks[i].price);
         if before.asks[i].qty > new_a {
-            dec_ask[i] = before.asks[i].qty - new_a;
+            flow.cancel_ask[i] = before.asks[i].qty - new_a;
         }
     }
-
-    let mut leftover = Vec::new();
-    for t in trades {
-        let remaining = match t.aggressor {
-            Aggressor::Sell => take_from_decrease(
-                t,
-                &before.bids,
-                &mut dec_bid,
-                &mut flow.exec_bid,
-                &mut flow.n_exec_bid,
-            ),
-            Aggressor::Buy => take_from_decrease(
-                t,
-                &before.asks,
-                &mut dec_ask,
-                &mut flow.exec_ask,
-                &mut flow.n_exec_ask,
-            ),
-        };
-        if remaining > 1e-12 {
-            leftover.push(PendingTrade {
-                price: t.price,
-                qty: remaining,
-                aggressor: t.aggressor,
-            });
-        }
-    }
-
-    flow.cancel_bid = dec_bid;
-    flow.cancel_ask = dec_ask;
-    for i in 0..MODEL_LEVELS {
-        if flow.cancel_bid[i] > 0.0 {
-            flow.n_cancel_bid[i] = 1;
-        }
-        if flow.cancel_ask[i] > 0.0 {
-            flow.n_cancel_ask[i] = 1;
-        }
-    }
-    (flow, leftover)
+    flow.refresh_cancel_counts();
+    flow
 }
 
 fn take_from_decrease(
     trade: &PendingTrade,
     levels: &[crate::market::book::Level; MODEL_LEVELS],
     dec: &mut [f64; MODEL_LEVELS],
+) -> bool {
+    let index = index_of(levels, trade.price).or_else(|| {
+        levels
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.price - trade.price)
+                    .abs()
+                    .total_cmp(&(b.price - trade.price).abs())
+            })
+            .map(|(i, _)| i)
+    });
+    let Some(i) = index else {
+        return false;
+    };
+    let take = trade.qty.min(dec[i]);
+    if take > 0.0 {
+        dec[i] -= take;
+        true
+    } else {
+        false
+    }
+}
+
+fn record_trade(
+    trade: &PendingTrade,
+    levels: &[crate::market::book::Level; MODEL_LEVELS],
     exec: &mut [f64; MODEL_LEVELS],
     n_exec: &mut [u32; MODEL_LEVELS],
-) -> f64 {
-    let mut remaining = trade.qty;
-    if let Some(i) = index_of(levels, trade.price) {
-        let take = remaining.min(dec[i]);
-        if take > 0.0 {
-            dec[i] -= take;
-            exec[i] += take;
-            n_exec[i] += 1;
-            remaining -= take;
-        }
-        return remaining;
+) {
+    let index = index_of(levels, trade.price).or_else(|| {
+        levels
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.price - trade.price)
+                    .abs()
+                    .total_cmp(&(b.price - trade.price).abs())
+            })
+            .map(|(i, _)| i)
+    });
+    if let Some(i) = index {
+        exec[i] += trade.qty;
+        n_exec[i] += 1;
     }
-    if let Some((i, _)) = levels
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| (a.price - trade.price).abs().total_cmp(&(b.price - trade.price).abs()))
-    {
-        let take = remaining.min(dec[i]);
-        if take > 0.0 {
-            dec[i] -= take;
-            exec[i] += take;
-            n_exec[i] += 1;
-            remaining -= take;
-        }
-    }
-    remaining
 }
 
 #[cfg(test)]
@@ -271,38 +296,39 @@ mod tests {
     }
 
     #[test]
-    fn match_prefers_trade_from_decrease_leftover_is_cancel() {
+    fn public_trade_is_recorded_and_excluded_from_cancel() {
         let before = flat_top(100.0, 100.1, 10.0, 10.0);
         let mut after = before;
         after.bids[0].qty = 4.0;
-        let trades = [PendingTrade {
+        let trade = PendingTrade {
             price: 100.0,
             qty: 3.0,
             aggressor: Aggressor::Sell,
-        }];
-        let (flow, left) = MatchedFlow::from_delta_and_trades(&before, &after, &trades);
-        assert!(left.is_empty());
-        assert!((flow.exec_bid[0] - 3.0).abs() < 1e-9);
-        assert!((flow.cancel_bid[0] - 3.0).abs() < 1e-9);
-        assert_eq!(flow.exec_ask[0], 0.0);
-        assert_eq!(flow.add_bid[0], 0.0);
+        };
+        let exec = MatchedFlow::from_trade(&before, &trade);
+        let mut book = MatchedFlow::from_book_delta(&before, &after);
+        assert!(book.exclude_trade_from_cancels(&before, &trade));
+        assert!((exec.exec_bid[0] - 3.0).abs() < 1e-9);
+        assert!((book.cancel_bid[0] - 3.0).abs() < 1e-9);
+        assert_eq!(exec.exec_ask[0], 0.0);
+        assert_eq!(book.add_bid[0], 0.0);
     }
 
     #[test]
-    fn unmatched_trade_qty_stays_pending_not_forced_exec() {
+    fn full_public_trade_is_kept_when_book_net_decrease_is_smaller() {
         let before = flat_top(100.0, 100.1, 10.0, 10.0);
         let mut after = before;
         after.bids[0].qty = 8.0;
-        let trades = [PendingTrade {
+        let trade = PendingTrade {
             price: 100.0,
             qty: 5.0,
             aggressor: Aggressor::Sell,
-        }];
-        let (flow, left) = MatchedFlow::from_delta_and_trades(&before, &after, &trades);
-        assert_eq!(left.len(), 1);
-        assert!((left[0].qty - 3.0).abs() < 1e-9);
-        assert!((flow.exec_bid[0] - 2.0).abs() < 1e-9);
-        assert_eq!(flow.cancel_bid[0], 0.0);
+        };
+        let exec = MatchedFlow::from_trade(&before, &trade);
+        let mut book = MatchedFlow::from_book_delta(&before, &after);
+        assert!(book.exclude_trade_from_cancels(&before, &trade));
+        assert!((exec.exec_bid[0] - 5.0).abs() < 1e-9);
+        assert_eq!(book.cancel_bid[0], 0.0);
     }
 
     #[test]
@@ -310,8 +336,23 @@ mod tests {
         let before = flat_top(100.0, 100.1, 10.0, 10.0);
         let mut after = before;
         after.asks[0].qty = 15.0;
-        let (flow, _) = MatchedFlow::from_delta_and_trades(&before, &after, &[]);
+        let flow = MatchedFlow::from_book_delta(&before, &after);
         assert!((flow.add_ask[0] - 5.0).abs() < 1e-9);
         assert_eq!(flow.cancel_ask[0], 0.0);
+    }
+
+    #[test]
+    fn sweep_across_levels_keeps_every_fill_quantity() {
+        let top = flat_top(100.0, 100.1, 10.0, 10.0);
+        let fills = [
+            PendingTrade { price: 100.1, qty: 8.0, aggressor: Aggressor::Buy },
+            PendingTrade { price: 100.2, qty: 12.0, aggressor: Aggressor::Buy },
+            PendingTrade { price: 100.3, qty: 20.0, aggressor: Aggressor::Buy },
+        ];
+        let total: f64 = fills
+            .iter()
+            .map(|trade| MatchedFlow::from_trade(&top, trade).exec_ask.iter().sum::<f64>())
+            .sum();
+        assert!((total - 40.0).abs() < 1e-9);
     }
 }
